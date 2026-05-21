@@ -1,0 +1,44 @@
+.node {
+  background: var(--node-bg);
+  color: var(--node-fg);
+  border: 1px solid var(--node-border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 100px;
+  max-width: 240px;
+  box-shadow: var(--node-shadow);
+  font-size: 14px;
+}
+
+.label {
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 1.2em;
+}
+
+.input {
+  width: 100%;
+  background: var(--node-input-bg);
+  color: var(--node-input-fg);
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: inherit;
+  font-family: inherit;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.handle {
+  background: var(--node-handle);
+  border: 2px solid var(--node-bg);
+  width: 10px;
+  height: 10px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.node:hover .handle {
+  opacity: 0.6;
+}

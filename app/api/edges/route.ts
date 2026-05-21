@@ -41,6 +41,8 @@ export async function POST(request: Request) {
       map_id: body.map_id,
       source_node_id: body.source_node_id,
       target_node_id: body.target_node_id,
+      source_handle: body.source_handle ?? null,
+      target_handle: body.target_handle ?? null,
     })
     .select()
     .single()

@@ -3,6 +3,16 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+
+  /* MindMap node theme */
+  --node-bg: #ffffff;
+  --node-fg: #111827;
+  --node-border: #d1d5db;
+  --node-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --node-input-bg: #ffffff;
+  --node-input-fg: #111827;
+  --node-handle: #6b7280;
+  --node-border-active: #3b82f6;
 }
 
 @theme inline {
@@ -16,6 +26,14 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+
+    --node-bg: #1f2937;
+    --node-fg: #f3f4f6;
+    --node-border: #4b5563;
+    --node-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --node-input-bg: #111827;
+    --node-input-fg: #f9fafb;
+    --node-handle: #9ca3af;
   }
 }
 
@@ -23,4 +41,9 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* ReactFlow canvas をテーマ背景に追随させる */
+.react-flow {
+  background: var(--background);
 }
