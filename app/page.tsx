@@ -128,7 +128,20 @@ export default function Home() {
     )
   }, [])
 
-  // 5. ダブルクリックでテキスト編集
+  // 5. 「全部消去」ボタン
+  const handleClearAll = async () => {
+    if (!window.confirm('全てのノードとエッジを削除します。よろしいですか?')) return
+    const res = await fetch('/api/nodes', { method: 'DELETE' })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      alert(`削除に失敗しました: ${body.error ?? res.statusText}`)
+      return
+    }
+    setNodes([])
+    setEdges([])
+  }
+
+  // 6. ダブルクリックでテキスト編集
   const onNodeDoubleClick = useCallback(
     async (_event: MouseEvent, node: Node) => {
       const newText = window.prompt('テキストを編集', String(node.data.label ?? ''))
@@ -170,6 +183,24 @@ export default function Home() {
         }}
       >
         + ノード追加
+      </button>
+      <button
+        onClick={handleClearAll}
+        style={{
+          position: 'absolute',
+          top: 16,
+          left: 160,
+          zIndex: 10,
+          padding: '8px 16px',
+          background: '#ef4444',
+          color: 'white',
+          border: 'none',
+          borderRadius: 6,
+          cursor: 'pointer',
+          fontSize: 14,
+        }}
+      >
+        全部消去
       </button>
       <ReactFlow
         nodes={nodes}
