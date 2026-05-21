@@ -1,65 +1,188 @@
-import Image from "next/image";
+'use client'
+
+import { useEffect, useState, useCallback } from 'react'
+import type { MouseEvent } from 'react'
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  applyNodeChanges,
+  applyEdgeChanges,
+  addEdge,
+  type Node,
+  type Edge,
+  type NodeChange,
+  type EdgeChange,
+  type Connection,
+} from '@xyflow/react'
+import '@xyflow/react/dist/style.css'
+
+// DBから来るデータの型
+type DbNode = {
+  id: string
+  text: string
+  position_x: number
+  position_y: number
+}
+type DbEdge = {
+  id: string
+  source_node_id: string
+  target_node_id: string
+}
 
 export default function Home() {
+  const [nodes, setNodes] = useState<Node[]>([])
+  const [edges, setEdges] = useState<Edge[]>([])
+  const [loading, setLoading] = useState(true)
+
+  // 1. 初回ロード: DBから既存データを取得して画面に反映
+  useEffect(() => {
+    async function load() {
+      const [dbNodes, dbEdges] = await Promise.all([
+        fetch('/api/nodes').then(r => r.json()) as Promise<DbNode[]>,
+        fetch('/api/edges').then(r => r.json()) as Promise<DbEdge[]>,
+      ])
+      setNodes(
+        dbNodes.map(n => ({
+          id: n.id,
+          position: { x: n.position_x, y: n.position_y },
+          data: { label: n.text },
+        }))
+      )
+      setEdges(
+        dbEdges.map(e => ({
+          id: e.id,
+          source: e.source_node_id,
+          target: e.target_node_id,
+        }))
+      )
+      setLoading(false)
+    }
+    load()
+  }, [])
+
+  // 2. 「+ ノード追加」ボタン
+  const handleAddNode = async () => {
+    const res = await fetch('/api/nodes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: '新しい思考',
+        position_x: Math.random() * 300 + 200,
+        position_y: Math.random() * 300 + 100,
+      }),
+    })
+    const newNode: DbNode = await res.json()
+    setNodes(nds => [
+      ...nds,
+      {
+        id: newNode.id,
+        position: { x: newNode.position_x, y: newNode.position_y },
+        data: { label: newNode.text },
+      },
+    ])
+  }
+
+  // 3. ノードのドラッグ → ドラッグ終了時に位置をDBに保存
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setNodes(nds => applyNodeChanges(changes, nds))
+    changes.forEach(change => {
+      if (change.type === 'position' && change.dragging === false && change.position) {
+        fetch(`/api/nodes/${change.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            position_x: change.position.x,
+            position_y: change.position.y,
+          }),
+        })
+      }
+    })
+  }, [])
+
+  const onEdgesChange = useCallback((changes: EdgeChange[]) => {
+    setEdges(eds => applyEdgeChanges(changes, eds))
+  }, [])
+
+  // 4. ノード同士を線で繋ぐ → DBにエッジを保存
+  const onConnect = useCallback(async (connection: Connection) => {
+    if (!connection.source || !connection.target) return
+    const res = await fetch('/api/edges', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source_node_id: connection.source,
+        target_node_id: connection.target,
+      }),
+    })
+    const newEdge: DbEdge = await res.json()
+    setEdges(eds =>
+      addEdge(
+        {
+          id: newEdge.id,
+          source: newEdge.source_node_id,
+          target: newEdge.target_node_id,
+        },
+        eds
+      )
+    )
+  }, [])
+
+  // 5. ダブルクリックでテキスト編集
+  const onNodeDoubleClick = useCallback(
+    async (_event: MouseEvent, node: Node) => {
+      const newText = window.prompt('テキストを編集', String(node.data.label ?? ''))
+      if (newText === null) return // キャンセル時
+      setNodes(nds =>
+        nds.map(n =>
+          n.id === node.id ? { ...n, data: { ...n.data, label: newText } } : n
+        )
+      )
+      await fetch(`/api/nodes/${node.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: newText }),
+      })
+    },
+    []
+  )
+
+  if (loading) {
+    return <div style={{ padding: 20 }}>Loading...</div>
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+    <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
+      <button
+        onClick={handleAddNode}
+        style={{
+          position: 'absolute',
+          top: 16,
+          left: 16,
+          zIndex: 10,
+          padding: '8px 16px',
+          background: '#3b82f6',
+          color: 'white',
+          border: 'none',
+          borderRadius: 6,
+          cursor: 'pointer',
+          fontSize: 14,
+        }}
+      >
+        + ノード追加
+      </button>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        onNodeDoubleClick={onNodeDoubleClick}
+        fitView
+      >
+        <Background />
+        <Controls />
+      </ReactFlow>
     </div>
-  );
+  )
 }
