@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
-// GET /api/nodes?map_id=xxx  → 指定マップのノード取得
+// GET /api/nodes?map_id=xxx  → 指定マップのノード取得 (parent_id, sort_order 含む)
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
   const mapId = searchParams.get('map_id')
@@ -13,7 +13,7 @@ export async function GET(request: Request) {
     .from('nodes')
     .select('*')
     .eq('map_id', mapId)
-    .order('created_at', { ascending: true })
+    .order('sort_order', { ascending: true })
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 })
@@ -21,7 +21,7 @@ export async function GET(request: Request) {
   return NextResponse.json(data)
 }
 
-// POST /api/nodes  → 新規ノード作成(body.map_id 必須)
+// POST /api/nodes  → 新規ノード作成 (parent_id, sort_order, side, collapsed 対応)
 export async function POST(request: Request) {
   const body = await request.json()
 
@@ -29,14 +29,22 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'map_id is required' }, { status: 400 })
   }
 
+  const insertPayload: Record<string, unknown> = {
+    map_id: body.map_id,
+    text: body.text ?? '',
+    position_x: body.position_x ?? 0,
+    position_y: body.position_y ?? 0,
+    parent_id: body.parent_id ?? null,
+    sort_order: body.sort_order ?? 0,
+    collapsed: body.collapsed ?? false,
+  }
+  if (body.side === 'left' || body.side === 'right') {
+    insertPayload.side = body.side
+  }
+
   const { data, error } = await supabase
     .from('nodes')
-    .insert({
-      map_id: body.map_id,
-      text: body.text ?? '',
-      position_x: body.position_x ?? 0,
-      position_y: body.position_y ?? 0,
-    })
+    .insert(insertPayload)
     .select()
     .single()
 

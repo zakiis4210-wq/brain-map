@@ -7,23 +7,35 @@ import styles from './MindMapNode.module.css'
 
 type MindMapNodeData = {
   label: string
+  isRoot?: boolean
+  side?: 'left' | 'right' | null
+  childCount?: number
+  collapsed?: boolean
   onLabelChange: (id: string, newText: string) => void
   onEditingChange: (id: string, isEditing: boolean) => void
+  onToggleCollapse?: (id: string) => void
 }
 
-function MindMapNodeComponent({ id, data }: NodeProps) {
-  const { label, onLabelChange, onEditingChange } = data as unknown as MindMapNodeData
+function MindMapNodeComponent({ id, data, selected }: NodeProps) {
+  const {
+    label,
+    isRoot,
+    side,
+    childCount,
+    collapsed,
+    onLabelChange,
+    onEditingChange,
+    onToggleCollapse,
+  } = data as unknown as MindMapNodeData
 
   const [isEditing, setIsEditing] = useState(false)
   const [draft, setDraft] = useState(label)
   const inputRef = useRef<HTMLInputElement | null>(null)
 
-  // 編集外の時は外側 label と draft を同期(保存後やリロード後の反映)
   useEffect(() => {
     if (!isEditing) setDraft(label)
   }, [label, isEditing])
 
-  // 編集開始時に input にフォーカス + 全選択
   useEffect(() => {
     if (isEditing && inputRef.current) {
       inputRef.current.focus()
@@ -61,7 +73,6 @@ function MindMapNodeComponent({ id, data }: NodeProps) {
       e.stopPropagation()
       cancel()
     } else {
-      // その他のキーは入力に通すが、外側のグローバル handler に届かないよう止める
       e.stopPropagation()
     }
   }
@@ -70,12 +81,65 @@ function MindMapNodeComponent({ id, data }: NodeProps) {
     if (isEditing) commit()
   }
 
+  // ルートノードは円形、子は丸角矩形
+  // ハンドル位置: ルートは左右両方、子は親側のみ target、反対側に source
+  const nodeClass = [
+    styles.node,
+    isRoot ? styles.root : '',
+    selected ? styles.selected : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+
   return (
-    <div className={styles.node}>
-      <Handle type="source" position={Position.Top} id="top" className={styles.handle} />
-      <Handle type="source" position={Position.Right} id="right" className={styles.handle} />
-      <Handle type="source" position={Position.Bottom} id="bottom" className={styles.handle} />
-      <Handle type="source" position={Position.Left} id="left" className={styles.handle} />
+    <div className={nodeClass}>
+      {/* ルートは左右両方に target/source、子はsideに応じて配置 */}
+      {isRoot ? (
+        <>
+          <Handle
+            type="source"
+            position={Position.Left}
+            id="left"
+            className={styles.handle}
+          />
+          <Handle
+            type="source"
+            position={Position.Right}
+            id="right"
+            className={styles.handle}
+          />
+        </>
+      ) : side === 'left' ? (
+        <>
+          <Handle
+            type="target"
+            position={Position.Right}
+            id="target-right"
+            className={styles.handle}
+          />
+          <Handle
+            type="source"
+            position={Position.Left}
+            id="left"
+            className={styles.handle}
+          />
+        </>
+      ) : (
+        <>
+          <Handle
+            type="target"
+            position={Position.Left}
+            id="target-left"
+            className={styles.handle}
+          />
+          <Handle
+            type="source"
+            position={Position.Right}
+            id="right"
+            className={styles.handle}
+          />
+        </>
+      )}
 
       {isEditing ? (
         <input
@@ -88,8 +152,25 @@ function MindMapNodeComponent({ id, data }: NodeProps) {
         />
       ) : (
         <div className={styles.label} onDoubleClick={enterEdit}>
-          {label || ' '}
+          {label || ' '}
         </div>
+      )}
+
+      {/* 折りたたみバッジ: 子があるときだけ表示 */}
+      {!isRoot && childCount && childCount > 0 && onToggleCollapse && (
+        <button
+          type="button"
+          className={`nodrag ${styles.collapseBadge} ${
+            side === 'left' ? styles.badgeLeft : styles.badgeRight
+          }`}
+          onClick={e => {
+            e.stopPropagation()
+            onToggleCollapse(id)
+          }}
+          title={collapsed ? '展開' : '折りたたみ'}
+        >
+          {collapsed ? `+${childCount}` : '−'}
+        </button>
       )}
     </div>
   )

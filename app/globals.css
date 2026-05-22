@@ -13,6 +13,8 @@
   --node-input-fg: #111827;
   --node-handle: #6b7280;
   --node-border-active: #3b82f6;
+  --edge-color: #9ca3af;
+  --edge-color-active: #3b82f6;
 }
 
 @theme inline {
@@ -34,6 +36,8 @@
     --node-input-bg: #111827;
     --node-input-fg: #f9fafb;
     --node-handle: #9ca3af;
+    --edge-color: #6b7280;
+    --edge-color-active: #60a5fa;
   }
 }
 

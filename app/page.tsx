@@ -6,60 +6,58 @@ import {
   ReactFlow,
   Background,
   Controls,
-  ConnectionMode,
+  MiniMap,
   applyNodeChanges,
-  applyEdgeChanges,
-  addEdge,
   type Node,
   type Edge,
   type NodeChange,
-  type EdgeChange,
-  type Connection,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import MindMapNode from './components/MindMapNode'
+import MindMapEdge from './components/MindMapEdge'
+import { computeLayout, type LayoutNode } from './lib/layout'
 
 // DBから来るデータの型
 type DbNode = {
   id: string
+  map_id: string
   text: string
   position_x: number
   position_y: number
-}
-type DbEdge = {
-  id: string
-  source_node_id: string
-  target_node_id: string
-  source_handle: string | null
-  target_handle: string | null
-}
-
-const nodeTypes = { mindmap: MindMapNode }
-type HandleId = 'top' | 'right' | 'bottom' | 'left'
-
-// 旧データ(handle=null)用フォールバック: 相対位置から最も自然なハンドルを推測
-function inferHandles(
-  sx: number,
-  sy: number,
-  tx: number,
-  ty: number
-): { source: HandleId; target: HandleId } {
-  const dx = tx - sx
-  const dy = ty - sy
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0
-      ? { source: 'right', target: 'left' }
-      : { source: 'left', target: 'right' }
-  }
-  return dy >= 0
-    ? { source: 'bottom', target: 'top' }
-    : { source: 'top', target: 'bottom' }
+  parent_id: string | null
+  sort_order: number
+  collapsed: boolean
+  side: 'left' | 'right' | null
 }
 type DbMap = {
   id: string
   name: string
   created_at: string
   updated_at: string
+}
+
+const nodeTypes = { mindmap: MindMapNode }
+const edgeTypes = { mindmap: MindMapEdge }
+
+// 表示用の補助: collapsed 状態を尊重し、折りたたまれた親の子孫を非表示にする
+function filterVisible(dbNodes: DbNode[]): Set<string> {
+  const byParent = new Map<string | null, DbNode[]>()
+  for (const n of dbNodes) {
+    const arr = byParent.get(n.parent_id) ?? []
+    arr.push(n)
+    byParent.set(n.parent_id, arr)
+  }
+  const visible = new Set<string>()
+  const roots = byParent.get(null) ?? []
+  const stack: DbNode[] = [...roots]
+  while (stack.length > 0) {
+    const cur = stack.pop()!
+    visible.add(cur.id)
+    if (cur.collapsed) continue
+    const cs = byParent.get(cur.id) ?? []
+    stack.push(...cs)
+  }
+  return visible
 }
 
 export default function Home() {
@@ -70,30 +68,27 @@ export default function Home() {
   const [loading, setLoading] = useState(true)
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null)
 
-  // 直列化キュー / activeNodeId・nodes・edges を最新値で読むための ref
+  // ref 群
   const pendingCreateRef = useRef<Promise<unknown>>(Promise.resolve())
   const activeIdRef = useRef<string | null>(null)
-  const nodesRef = useRef<Node[]>([])
-  const edgesRef = useRef<Edge[]>([])
+  const dbNodesRef = useRef<DbNode[]>([])
+  const currentMapIdRef = useRef<string | null>(null)
+
   useEffect(() => {
-    nodesRef.current = nodes
-  }, [nodes])
-  useEffect(() => {
-    edgesRef.current = edges
-  }, [edges])
+    currentMapIdRef.current = currentMapId
+  }, [currentMapId])
+
   const updateActive = useCallback((id: string | null) => {
     activeIdRef.current = id
     setActiveNodeId(id)
   }, [])
 
-  // currentMapId を ref でも保持(stable な data コールバックから読むため)
-  const currentMapIdRef = useRef<string | null>(null)
-  useEffect(() => {
-    currentMapIdRef.current = currentMapId
-  }, [currentMapId])
-
-  // インライン編集: ラベル変更 (data 経由で MindMapNode から呼ばれる)
+  // ===== ラベル編集 =====
   const handleNodeLabelChange = useCallback((nodeId: string, newText: string) => {
+    // DB ノードキャッシュ更新
+    dbNodesRef.current = dbNodesRef.current.map(n =>
+      n.id === nodeId ? { ...n, text: newText } : n
+    )
     setNodes(nds =>
       nds.map(n =>
         n.id === nodeId ? { ...n, data: { ...n.data, label: newText } } : n
@@ -104,33 +99,119 @@ export default function Home() {
     void fetch(`/api/nodes/${nodeId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ map_id: mapId, text: newText }),
+      body: JSON.stringify({ text: newText }),
     })
   }, [])
 
-  // インライン編集: 編集モード切替時に対象ノードの draggable を反転
   const handleEditingChange = useCallback((nodeId: string, isEditing: boolean) => {
     setNodes(nds =>
       nds.map(n => (n.id === nodeId ? { ...n, draggable: !isEditing } : n))
     )
   }, [])
 
-  // DbNode → ReactFlow Node 変換 (type と data コールバックを統一して付与)
-  const toFlowNode = useCallback(
-    (n: DbNode): Node => ({
-      id: n.id,
-      type: 'mindmap',
-      position: { x: n.position_x, y: n.position_y },
-      data: {
-        label: n.text,
-        onLabelChange: handleNodeLabelChange,
-        onEditingChange: handleEditingChange,
-      },
-    }),
-    [handleNodeLabelChange, handleEditingChange]
-  )
+  // ===== 折りたたみ =====
+  const handleToggleCollapse = useCallback((nodeId: string) => {
+    const target = dbNodesRef.current.find(n => n.id === nodeId)
+    if (!target) return
+    const newCollapsed = !target.collapsed
+    dbNodesRef.current = dbNodesRef.current.map(n =>
+      n.id === nodeId ? { ...n, collapsed: newCollapsed } : n
+    )
+    void fetch(`/api/nodes/${nodeId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ collapsed: newCollapsed }),
+    })
+    // 再描画
+    rerenderFromDb()
+  }, [])
 
-  // 1. 初回起動: マップ一覧を取得し、無ければ作成 → 最初のマップを選択
+  // ===== DB ノード → React Flow Node/Edge への変換 =====
+  const rerenderFromDb = useCallback(() => {
+    const dbNodes = dbNodesRef.current
+    const visible = filterVisible(dbNodes)
+    const childCountMap = new Map<string, number>()
+    for (const n of dbNodes) {
+      if (n.parent_id) {
+        childCountMap.set(n.parent_id, (childCountMap.get(n.parent_id) ?? 0) + 1)
+      }
+    }
+    const rfNodes: Node[] = dbNodes
+      .filter(n => visible.has(n.id))
+      .map(n => ({
+        id: n.id,
+        type: 'mindmap',
+        position: { x: n.position_x, y: n.position_y },
+        data: {
+          label: n.text,
+          isRoot: n.parent_id === null,
+          side: n.side,
+          childCount: childCountMap.get(n.id) ?? 0,
+          collapsed: n.collapsed,
+          onLabelChange: handleNodeLabelChange,
+          onEditingChange: handleEditingChange,
+          onToggleCollapse: handleToggleCollapse,
+        },
+      }))
+    // 木構造のエッジ: parent → child
+    const rfEdges: Edge[] = dbNodes
+      .filter(n => n.parent_id !== null && visible.has(n.id) && visible.has(n.parent_id!))
+      .map(n => {
+        // 子の side で接続方向を決定
+        const parentHandle = n.side === 'left' ? 'left' : 'right'
+        const childHandle = n.side === 'left' ? 'target-right' : 'target-left'
+        return {
+          id: `e-${n.parent_id}-${n.id}`,
+          source: n.parent_id!,
+          target: n.id,
+          sourceHandle: parentHandle,
+          targetHandle: childHandle,
+          type: 'mindmap',
+        }
+      })
+    setNodes(rfNodes)
+    setEdges(rfEdges)
+  }, [handleNodeLabelChange, handleEditingChange, handleToggleCollapse])
+
+  // ===== 自動レイアウトを実行して DB にも保存 =====
+  const runAutoLayout = useCallback(async (mapId: string) => {
+    const dbNodes = dbNodesRef.current
+    if (dbNodes.length === 0) return
+    const layoutInput: LayoutNode[] = dbNodes.map(n => ({
+      id: n.id,
+      parent_id: n.parent_id,
+      sort_order: n.sort_order,
+      side: n.side,
+      collapsed: n.collapsed,
+      text: n.text,
+    }))
+    // ルートを画面中央っぽい位置に
+    const results = computeLayout(layoutInput, 0, 0)
+    const byId = new Map(results.map(r => [r.id, r]))
+    dbNodesRef.current = dbNodes.map(n => {
+      const r = byId.get(n.id)
+      if (!r) return n
+      return { ...n, position_x: r.position_x, position_y: r.position_y, side: r.side }
+    })
+    rerenderFromDb()
+    // バルク保存
+    await fetch('/api/nodes/bulk', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        updates: results.map(r => ({
+          id: r.id,
+          position_x: r.position_x,
+          position_y: r.position_y,
+          side: r.side,
+        })),
+      }),
+    })
+    // mapId はバルク API では暗黙(id 指定なので不要)
+    void mapId
+  }, [rerenderFromDb])
+
+  // ===== 初回起動: マップ取得 or 作成 =====
   useEffect(() => {
     async function bootstrap() {
       let list = (await fetch('/api/maps').then(r => r.json())) as DbMap[]
@@ -148,43 +229,33 @@ export default function Home() {
     bootstrap()
   }, [])
 
-  // 2. currentMapId が変わったら、そのマップのノード/エッジを再取得
+  // ===== マップ切替時: ノードを取得 + ルートが無ければ作成 =====
   useEffect(() => {
     if (!currentMapId) return
     let cancelled = false
     async function load(mapId: string) {
       setLoading(true)
-      const [dbNodes, dbEdges] = await Promise.all([
-        fetch(`/api/nodes?map_id=${mapId}`).then(r => r.json()) as Promise<DbNode[]>,
-        fetch(`/api/edges?map_id=${mapId}`).then(r => r.json()) as Promise<DbEdge[]>,
-      ])
+      let dbNodes = (await fetch(`/api/nodes?map_id=${mapId}`).then(r => r.json())) as DbNode[]
       if (cancelled) return
-      setNodes(dbNodes.map(toFlowNode))
-      const posMap = new Map(dbNodes.map(n => [n.id, n]))
-      setEdges(
-        dbEdges.map(e => {
-          let sourceHandle: HandleId | string | null = e.source_handle
-          let targetHandle: HandleId | string | null = e.target_handle
-          // どちらかが null なら、ソース/ターゲットノードの相対位置から推測して埋める
-          if (!sourceHandle || !targetHandle) {
-            const sn = posMap.get(e.source_node_id)
-            const tn = posMap.get(e.target_node_id)
-            if (sn && tn) {
-              const inferred = inferHandles(sn.position_x, sn.position_y, tn.position_x, tn.position_y)
-              if (!sourceHandle) sourceHandle = inferred.source
-              if (!targetHandle) targetHandle = inferred.target
-            }
-          }
-          return {
-            id: e.id,
-            source: e.source_node_id,
-            target: e.target_node_id,
-            ...(sourceHandle ? { sourceHandle } : {}),
-            ...(targetHandle ? { targetHandle } : {}),
-          }
-        })
-      )
-      // マップ切替時に active をリセット
+      // ルート(parent_id = null)が無ければ自動作成
+      const hasRoot = dbNodes.some(n => n.parent_id === null)
+      if (!hasRoot) {
+        const created = await fetch('/api/nodes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            map_id: mapId,
+            text: 'セントラルテーマ',
+            position_x: 0,
+            position_y: 0,
+            parent_id: null,
+            sort_order: 0,
+          }),
+        }).then(r => r.json())
+        dbNodes = [created]
+      }
+      dbNodesRef.current = dbNodes
+      rerenderFromDb()
       updateActive(null)
       setLoading(false)
     }
@@ -192,89 +263,113 @@ export default function Home() {
     return () => {
       cancelled = true
     }
-  }, [currentMapId, updateActive, toFlowNode])
+  }, [currentMapId, updateActive, rerenderFromDb])
 
-  // 3. ノード作成の共通処理(API + state + 任意でエッジ自動作成)
-  //    opts.activate: false にすると active は更新しない(Tab/Enterで親を維持するため)
-  const createNode = useCallback(
-    async (
-      x: number,
-      y: number,
-      opts: {
-        connectFromId?: string | null
-        fromHandle?: HandleId
-        toHandle?: HandleId
-        text?: string
-        activate?: boolean
-      } = {}
-    ) => {
-      if (!currentMapId) return null
+  // ===== ノード作成(親指定) =====
+  const createChildNode = useCallback(
+    async (parentId: string, opts: { text?: string; activate?: boolean } = {}) => {
+      const mapId = currentMapIdRef.current
+      if (!mapId) return null
+      const dbNodes = dbNodesRef.current
+      const parent = dbNodes.find(n => n.id === parentId)
+      if (!parent) return null
+
+      // side の決定: 親がルートなら左右バランス、それ以外は親の side を継承
+      let side: 'left' | 'right' = 'right'
+      if (parent.parent_id === null) {
+        const rightCount = dbNodes.filter(n => n.parent_id === parent.id && n.side === 'right').length
+        const leftCount = dbNodes.filter(n => n.parent_id === parent.id && n.side === 'left').length
+        side = rightCount <= leftCount ? 'right' : 'left'
+      } else {
+        side = parent.side ?? 'right'
+      }
+
+      // sort_order: 兄弟の末尾
+      const siblings = dbNodes.filter(n => n.parent_id === parent.id && n.side === side)
+      const sortOrder = siblings.length
+
       const res = await fetch('/api/nodes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          map_id: currentMapId,
+          map_id: mapId,
           text: opts.text ?? '新しい思考',
-          position_x: x,
-          position_y: y,
+          position_x: parent.position_x + (side === 'right' ? 200 : -200),
+          position_y: parent.position_y,
+          parent_id: parent.id,
+          sort_order: sortOrder,
+          side,
         }),
       })
       if (!res.ok) return null
       const newNode: DbNode = await res.json()
-      setNodes(nds => [...nds, toFlowNode(newNode)])
+      dbNodesRef.current = [...dbNodesRef.current, newNode]
+      // 自動レイアウト → 描画
+      await runAutoLayout(mapId)
       if (opts.activate !== false) {
-        activeIdRef.current = newNode.id
-        setActiveNodeId(newNode.id)
-      }
-
-      if (opts.connectFromId) {
-        const edgeRes = await fetch('/api/edges', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            map_id: currentMapId,
-            source_node_id: opts.connectFromId,
-            target_node_id: newNode.id,
-            source_handle: opts.fromHandle ?? null,
-            target_handle: opts.toHandle ?? null,
-          }),
-        })
-        if (edgeRes.ok) {
-          const newEdge: DbEdge = await edgeRes.json()
-          const newRfEdge: Edge = {
-            id: newEdge.id,
-            source: newEdge.source_node_id,
-            target: newEdge.target_node_id,
-            ...(newEdge.source_handle ? { sourceHandle: newEdge.source_handle } : {}),
-            ...(newEdge.target_handle ? { targetHandle: newEdge.target_handle } : {}),
-          }
-          setEdges(eds => addEdge(newRfEdge, eds))
-          // 連打時の兄弟数カウントを正しくするため edgesRef も即時更新
-          edgesRef.current = addEdge(newRfEdge, edgesRef.current)
-        }
+        updateActive(newNode.id)
       }
       return newNode
     },
-    [currentMapId, toFlowNode]
+    [runAutoLayout, updateActive]
   )
 
-  // 3b. 「+ ノード追加」ボタン (ランダム配置)
-  const handleAddNode = useCallback(() => {
-    void createNode(Math.random() * 300 + 200, Math.random() * 300 + 100)
-  }, [createNode])
+  // ===== 兄弟ノード作成 =====
+  const createSiblingNode = useCallback(
+    async (nodeId: string, opts: { text?: string; activate?: boolean } = {}) => {
+      const mapId = currentMapIdRef.current
+      if (!mapId) return null
+      const dbNodes = dbNodesRef.current
+      const target = dbNodes.find(n => n.id === nodeId)
+      if (!target) return null
+      // ルートに兄弟は作れない(ルート自体が唯一)
+      if (target.parent_id === null) return null
+      // 同じ親・同じ side の末尾に追加
+      const siblings = dbNodes.filter(
+        n => n.parent_id === target.parent_id && n.side === target.side
+      )
+      const sortOrder = siblings.length
+      const res = await fetch('/api/nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          map_id: mapId,
+          text: opts.text ?? '新しい思考',
+          position_x: target.position_x,
+          position_y: target.position_y + 80,
+          parent_id: target.parent_id,
+          sort_order: sortOrder,
+          side: target.side,
+        }),
+      })
+      if (!res.ok) return null
+      const newNode: DbNode = await res.json()
+      dbNodesRef.current = [...dbNodesRef.current, newNode]
+      await runAutoLayout(mapId)
+      if (opts.activate !== false) {
+        updateActive(newNode.id)
+      }
+      return newNode
+    },
+    [runAutoLayout, updateActive]
+  )
 
-  // 4. ノードのドラッグ → ドラッグ終了時に位置をDBに保存
+  // ===== ノードのドラッグ → 位置だけDBに保存(parent_id は維持) =====
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       setNodes(nds => applyNodeChanges(changes, nds))
-      if (!currentMapId) return
       changes.forEach(change => {
         if (change.type === 'position' && change.dragging === false && change.position) {
-          fetch(`/api/nodes/${change.id}`, {
+          // dbNodesRef も同期
+          dbNodesRef.current = dbNodesRef.current.map(n =>
+            n.id === change.id
+              ? { ...n, position_x: change.position!.x, position_y: change.position!.y }
+              : n
+          )
+          void fetch(`/api/nodes/${change.id}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              map_id: currentMapId,
               position_x: change.position.x,
               position_y: change.position.y,
             }),
@@ -282,90 +377,92 @@ export default function Home() {
         }
       })
     },
-    [currentMapId]
+    []
   )
 
-  const onEdgesChange = useCallback((changes: EdgeChange[]) => {
-    setEdges(eds => applyEdgeChanges(changes, eds))
-  }, [])
+  // ===== サブツリー削除 =====
+  const deleteSubtree = useCallback(async (nodeId: string) => {
+    const target = dbNodesRef.current.find(n => n.id === nodeId)
+    if (!target) return
+    if (target.parent_id === null) {
+      alert('ルートノードは削除できません')
+      return
+    }
+    if (!window.confirm('このノードと子孫を全て削除しますか?')) return
+    // DB は CASCADE で子孫も消える
+    const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' })
+    if (!res.ok) {
+      alert('削除に失敗しました')
+      return
+    }
+    // クライアント側: 子孫を再帰収集して除外
+    const toDelete = new Set<string>()
+    const stack = [nodeId]
+    while (stack.length > 0) {
+      const cur = stack.pop()!
+      toDelete.add(cur)
+      for (const n of dbNodesRef.current) {
+        if (n.parent_id === cur) stack.push(n.id)
+      }
+    }
+    dbNodesRef.current = dbNodesRef.current.filter(n => !toDelete.has(n.id))
+    updateActive(null)
+    const mapId = currentMapIdRef.current
+    if (mapId) await runAutoLayout(mapId)
+  }, [runAutoLayout, updateActive])
 
-  // 5. ノード同士を線で繋ぐ → DBにエッジを保存
-  const onConnect = useCallback(
-    async (connection: Connection) => {
-      if (!connection.source || !connection.target || !currentMapId) return
-      const res = await fetch('/api/edges', {
+  // ===== マップ全部消去(ルートは残す) =====
+  const handleClearAll = async () => {
+    if (!currentMapId) return
+    if (!window.confirm('このマップの全ノード(ルート以外)を削除します。よろしいですか?')) return
+    const res = await fetch(`/api/nodes?map_id=${currentMapId}`, { method: 'DELETE' })
+    if (!res.ok) {
+      alert('削除に失敗しました')
+      return
+    }
+    // 再ロード(ルートを再生成)
+    setCurrentMapId(currentMapId) // useEffect で reload はされないので明示再取得
+    const dbNodes = (await fetch(`/api/nodes?map_id=${currentMapId}`).then(r => r.json())) as DbNode[]
+    let nodes = dbNodes
+    const hasRoot = nodes.some(n => n.parent_id === null)
+    if (!hasRoot) {
+      const created = await fetch('/api/nodes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           map_id: currentMapId,
-          source_node_id: connection.source,
-          target_node_id: connection.target,
-          source_handle: connection.sourceHandle ?? null,
-          target_handle: connection.targetHandle ?? null,
+          text: 'セントラルテーマ',
+          position_x: 0,
+          position_y: 0,
+          parent_id: null,
+          sort_order: 0,
         }),
-      })
-      const newEdge: DbEdge = await res.json()
-      setEdges(eds =>
-        addEdge(
-          {
-            id: newEdge.id,
-            source: newEdge.source_node_id,
-            target: newEdge.target_node_id,
-            ...(newEdge.source_handle ? { sourceHandle: newEdge.source_handle } : {}),
-            ...(newEdge.target_handle ? { targetHandle: newEdge.target_handle } : {}),
-          },
-          eds
-        )
-      )
-    },
-    [currentMapId]
-  )
-
-  // 6. 「全部消去」ボタン (現在のマップ内のみ)
-  const handleClearAll = async () => {
-    if (!currentMapId) return
-    if (!window.confirm('このマップのノードとエッジを全て削除します。よろしいですか?')) return
-    const res = await fetch(`/api/nodes?map_id=${currentMapId}`, { method: 'DELETE' })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      alert(`削除に失敗しました: ${body.error ?? res.statusText}`)
-      return
+      }).then(r => r.json())
+      nodes = [created]
     }
-    setNodes([])
-    setEdges([])
-    edgesRef.current = []
+    dbNodesRef.current = nodes
+    rerenderFromDb()
     updateActive(null)
   }
 
-  // 7. (旧 onNodeDoubleClick は MindMapNode 内のインライン編集に置換済み)
-
-  // 8. 「マップ削除」ボタン
+  // ===== マップ操作 =====
   const handleDeleteMap = async () => {
     if (!currentMapId) return
     const target = maps.find(m => m.id === currentMapId)
     if (!target) return
     if (!window.confirm(`『${target.name}』を削除しますか?中のノードもすべて消えます。`)) return
-
     const res = await fetch(`/api/maps/${currentMapId}`, { method: 'DELETE' })
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      alert(`マップ削除に失敗しました: ${body.error ?? res.statusText}`)
+      alert('マップ削除に失敗しました')
       return
     }
-
     const remaining = maps.filter(m => m.id !== currentMapId)
     if (remaining.length === 0) {
-      // 0件になったら新規マップを自動作成 (Phase 2 初回起動と同じロジック)
       const createRes = await fetch('/api/maps', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: '最初のマップ' }),
       })
-      if (!createRes.ok) {
-        const body = await createRes.json().catch(() => ({}))
-        alert(`マップ作成に失敗しました: ${body.error ?? createRes.statusText}`)
-        return
-      }
       const created: DbMap = await createRes.json()
       setMaps([created])
       setCurrentMapId(created.id)
@@ -375,7 +472,6 @@ export default function Home() {
     }
   }
 
-  // 9. 「+ 新規マップ」ボタン
   const handleCreateMap = async () => {
     const name = window.prompt('マップ名を入力', '新しいマップ')
     if (name === null) return
@@ -385,8 +481,7 @@ export default function Home() {
       body: JSON.stringify({ name: name || '新しいマップ' }),
     })
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      alert(`マップ作成に失敗しました: ${body.error ?? res.statusText}`)
+      alert('マップ作成に失敗しました')
       return
     }
     const created: DbMap = await res.json()
@@ -394,59 +489,118 @@ export default function Home() {
     setCurrentMapId(created.id)
   }
 
-  // 10. Tab/Enterキーでアクティブノードから連続作成 (Tab=右, Enter=下)
+  // ===== キーボードショートカット =====
+  // Tab: 子ノード追加, Enter: 兄弟ノード追加, Delete: サブツリー削除
+  // 矢印: ノード間移動(親/子/兄弟)
   useEffect(() => {
     if (!currentMapId) return
     const handler = (e: KeyboardEvent) => {
-      if (e.key !== 'Tab' && e.key !== 'Enter') return
       const focused = document.activeElement as HTMLElement | null
       if (focused) {
         const tag = focused.tagName
         if (tag === 'INPUT' || tag === 'TEXTAREA' || focused.isContentEditable) return
       }
-      e.preventDefault()
-      const direction: 'right' | 'down' = e.key === 'Tab' ? 'right' : 'down'
-      pendingCreateRef.current = pendingCreateRef.current
-        .then(() => {
-          const activeId = activeIdRef.current
-          const activeNode = activeId
-            ? nodesRef.current.find(n => n.id === activeId)
-            : null
-          if (activeNode) {
-            const { x, y } = activeNode.position
-            const fromHandle: HandleId = direction === 'right' ? 'right' : 'bottom'
-            const toHandle: HandleId = direction === 'right' ? 'left' : 'top'
-            // 親から同じ方向に既に出ているエッジ数 = 兄弟数
-            const siblingCount = edgesRef.current.filter(
-              e => e.source === activeNode.id && e.sourceHandle === fromHandle
-            ).length
-            const newPos =
-              direction === 'right'
-                ? { x: x + 200, y: y + 80 * siblingCount }
-                : { x: x + 220 * siblingCount, y: y + 150 }
-            return createNode(newPos.x, newPos.y, {
-              connectFromId: activeNode.id,
-              fromHandle,
-              toHandle,
-              activate: false, // 親(active)を維持して放射状に枝分かれさせる
-            })
+
+      const activeId = activeIdRef.current
+      const dbNodes = dbNodesRef.current
+
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        pendingCreateRef.current = pendingCreateRef.current
+          .then(() => {
+            const target = activeId ?? dbNodes.find(n => n.parent_id === null)?.id
+            if (!target) return
+            return createChildNode(target)
+          })
+          .catch(() => {})
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        pendingCreateRef.current = pendingCreateRef.current
+          .then(() => {
+            if (!activeId) return
+            return createSiblingNode(activeId)
+          })
+          .catch(() => {})
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (!activeId) return
+        e.preventDefault()
+        void deleteSubtree(activeId)
+      } else if (e.key === 'F2') {
+        if (!activeId) return
+        e.preventDefault()
+        // 編集モード起動: そのノードのラベルダブルクリック相当を模倣
+        const el = document.querySelector(`[data-id="${activeId}"] .react-flow__node`)
+        if (el) {
+          ;(el as HTMLElement).dispatchEvent(
+            new MouseEvent('dblclick', { bubbles: true })
+          )
+        }
+      } else if (
+        e.key === 'ArrowUp' ||
+        e.key === 'ArrowDown' ||
+        e.key === 'ArrowLeft' ||
+        e.key === 'ArrowRight'
+      ) {
+        if (!activeId) return
+        const cur = dbNodes.find(n => n.id === activeId)
+        if (!cur) return
+        e.preventDefault()
+        let nextId: string | null = null
+        if (e.key === 'ArrowLeft') {
+          if (cur.side === 'left') {
+            // 左方向の子へ
+            const child = dbNodes
+              .filter(n => n.parent_id === cur.id && n.side === 'left')
+              .sort((a, b) => a.sort_order - b.sort_order)[0]
+            if (child) nextId = child.id
+          } else if (cur.parent_id === null) {
+            const child = dbNodes
+              .filter(n => n.parent_id === cur.id && n.side === 'left')
+              .sort((a, b) => a.sort_order - b.sort_order)[0]
+            if (child) nextId = child.id
+          } else {
+            // 親へ
+            nextId = cur.parent_id
           }
-          // active 無し → 画面中央付近に作成、エッジ無し、active には設定(以降の枝分かれ起点に)
-          return createNode(400, 300)
-        })
-        .catch(() => {})
+        } else if (e.key === 'ArrowRight') {
+          if (cur.side === 'right' || cur.parent_id === null) {
+            const child = dbNodes
+              .filter(n => n.parent_id === cur.id && (n.side === 'right' || cur.parent_id === null))
+              .sort((a, b) => a.sort_order - b.sort_order)[0]
+            if (child) nextId = child.id
+          } else {
+            nextId = cur.parent_id
+          }
+        } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          // 兄弟間移動
+          if (cur.parent_id) {
+            const siblings = dbNodes
+              .filter(n => n.parent_id === cur.parent_id && n.side === cur.side)
+              .sort((a, b) => a.sort_order - b.sort_order)
+            const idx = siblings.findIndex(s => s.id === cur.id)
+            if (e.key === 'ArrowUp' && idx > 0) nextId = siblings[idx - 1].id
+            if (e.key === 'ArrowDown' && idx < siblings.length - 1) nextId = siblings[idx + 1].id
+          }
+        }
+        if (nextId) updateActive(nextId)
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [currentMapId, createNode])
+  }, [currentMapId, createChildNode, createSiblingNode, deleteSubtree, updateActive])
 
-  // 11. ノードクリックで active 更新
+  // ===== ノードクリックで active 更新 =====
   const onNodeClick = useCallback(
     (_event: MouseEvent, node: Node) => {
       updateActive(node.id)
     },
     [updateActive]
   )
+
+  // ===== 選択状態を React Flow に反映 =====
+  useEffect(() => {
+    setNodes(nds => nds.map(n => ({ ...n, selected: n.id === activeNodeId })))
+  }, [activeNodeId])
 
   if (loading || !currentMapId) {
     return <div style={{ padding: 20 }}>Loading...</div>
@@ -464,7 +618,7 @@ export default function Home() {
 
   return (
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
-      {/* マップ選択UI (上段) */}
+      {/* 上段: マップ操作 */}
       <div
         style={{
           position: 'absolute',
@@ -494,10 +648,7 @@ export default function Home() {
             </option>
           ))}
         </select>
-        <button
-          onClick={handleCreateMap}
-          style={{ ...buttonBase, background: '#10b981' }}
-        >
+        <button onClick={handleCreateMap} style={{ ...buttonBase, background: '#10b981' }}>
           + 新規マップ
         </button>
         <button
@@ -515,33 +666,81 @@ export default function Home() {
         </button>
       </div>
 
-      {/* 操作ボタン (下段) */}
-      <button
-        onClick={handleAddNode}
-        style={{ ...buttonBase, position: 'absolute', top: 64, left: 16, background: '#3b82f6' }}
+      {/* 下段: ノード操作 */}
+      <div
+        style={{
+          position: 'absolute',
+          top: 64,
+          left: 16,
+          zIndex: 10,
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+        }}
       >
-        + ノード追加
-      </button>
-      <button
-        onClick={handleClearAll}
-        style={{ ...buttonBase, position: 'absolute', top: 64, left: 160, background: '#ef4444' }}
+        <button
+          onClick={() => {
+            const target = activeIdRef.current ?? dbNodesRef.current.find(n => n.parent_id === null)?.id
+            if (target) void createChildNode(target)
+          }}
+          style={{ ...buttonBase, background: '#3b82f6' }}
+          title="Tab"
+        >
+          + 子ノード (Tab)
+        </button>
+        <button
+          onClick={() => {
+            const id = activeIdRef.current
+            if (id) void createSiblingNode(id)
+          }}
+          style={{ ...buttonBase, background: '#6366f1' }}
+          title="Enter"
+        >
+          + 兄弟 (Enter)
+        </button>
+        <button
+          onClick={() => currentMapId && void runAutoLayout(currentMapId)}
+          style={{ ...buttonBase, background: '#8b5cf6' }}
+          title="自動整列"
+        >
+          ⟳ 整列
+        </button>
+        <button onClick={handleClearAll} style={{ ...buttonBase, background: '#ef4444' }}>
+          全部消去
+        </button>
+      </div>
+
+      {/* ヘルプ表示 */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 16,
+          left: 16,
+          zIndex: 10,
+          background: 'rgba(0,0,0,0.6)',
+          color: 'white',
+          padding: '8px 12px',
+          borderRadius: 6,
+          fontSize: 12,
+          lineHeight: 1.5,
+        }}
       >
-        全部消去
-      </button>
+        Tab: 子追加 / Enter: 兄弟追加 / F2: 編集 / Delete: 削除 / 矢印: 移動
+      </div>
 
       <ReactFlow
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
-        connectionMode={ConnectionMode.Loose}
+        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
         onNodeClick={onNodeClick}
+        nodesConnectable={false}
         fitView
       >
         <Background />
         <Controls />
+        <MiniMap pannable zoomable />
       </ReactFlow>
     </div>
   )
