@@ -15,7 +15,8 @@ import {
 import '@xyflow/react/dist/style.css'
 import MindMapNode from './components/MindMapNode'
 import MindMapEdge from './components/MindMapEdge'
-import { computeLayout, type LayoutNode } from './lib/layout'
+import NodeToolbar from './components/NodeToolbar'
+import { computeLayout, type LayoutNode } from '@/lib/mindmap-layout'
 
 // DBから来るデータの型
 type DbNode = {
@@ -28,6 +29,8 @@ type DbNode = {
   sort_order: number
   collapsed: boolean
   side: 'left' | 'right' | null
+  color: string | null
+  icon: string | null
 }
 type DbMap = {
   id: string
@@ -39,7 +42,6 @@ type DbMap = {
 const nodeTypes = { mindmap: MindMapNode }
 const edgeTypes = { mindmap: MindMapEdge }
 
-// 表示用の補助: collapsed 状態を尊重し、折りたたまれた親の子孫を非表示にする
 function filterVisible(dbNodes: DbNode[]): Set<string> {
   const byParent = new Map<string | null, DbNode[]>()
   for (const n of dbNodes) {
@@ -60,6 +62,22 @@ function filterVisible(dbNodes: DbNode[]): Set<string> {
   return visible
 }
 
+// あるノードの子孫集合 (自分自身は含めない)
+function getDescendants(dbNodes: DbNode[], rootId: string): Set<string> {
+  const res = new Set<string>()
+  const stack = [rootId]
+  while (stack.length > 0) {
+    const cur = stack.pop()!
+    for (const n of dbNodes) {
+      if (n.parent_id === cur && !res.has(n.id)) {
+        res.add(n.id)
+        stack.push(n.id)
+      }
+    }
+  }
+  return res
+}
+
 export default function Home() {
   const [nodes, setNodes] = useState<Node[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
@@ -67,16 +85,22 @@ export default function Home() {
   const [currentMapId, setCurrentMapId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null)
+  const [dragSourceId, setDragSourceId] = useState<string | null>(null)
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null)
 
-  // ref 群
   const pendingCreateRef = useRef<Promise<unknown>>(Promise.resolve())
   const activeIdRef = useRef<string | null>(null)
   const dbNodesRef = useRef<DbNode[]>([])
   const currentMapIdRef = useRef<string | null>(null)
+  const dragSourceRef = useRef<string | null>(null)
 
   useEffect(() => {
     currentMapIdRef.current = currentMapId
   }, [currentMapId])
+
+  useEffect(() => {
+    dragSourceRef.current = dragSourceId
+  }, [dragSourceId])
 
   const updateActive = useCallback((id: string | null) => {
     activeIdRef.current = id
@@ -85,7 +109,6 @@ export default function Home() {
 
   // ===== ラベル編集 =====
   const handleNodeLabelChange = useCallback((nodeId: string, newText: string) => {
-    // DB ノードキャッシュ更新
     dbNodesRef.current = dbNodesRef.current.map(n =>
       n.id === nodeId ? { ...n, text: newText } : n
     )
@@ -109,7 +132,6 @@ export default function Home() {
     )
   }, [])
 
-  // ===== 折りたたみ =====
   const handleToggleCollapse = useCallback((nodeId: string) => {
     const target = dbNodesRef.current.find(n => n.id === nodeId)
     if (!target) return
@@ -122,11 +144,133 @@ export default function Home() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ collapsed: newCollapsed }),
     })
-    // 再描画
     rerenderFromDb()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ===== DB ノード → React Flow Node/Edge への変換 =====
+  // ===== 親付け替えハンドラ =====
+  const handleReparentDragStart = useCallback((id: string) => {
+    setDragSourceId(id)
+    dragSourceRef.current = id
+  }, [])
+
+  const handleReparentDragEnd = useCallback(() => {
+    setDragSourceId(null)
+    setDropTargetId(null)
+    dragSourceRef.current = null
+  }, [])
+
+  const handleReparentDragOver = useCallback((id: string) => {
+    const src = dragSourceRef.current
+    if (!src || src === id) return
+    // 自分の子孫には移動できない
+    const descendants = getDescendants(dbNodesRef.current, src)
+    if (descendants.has(id)) return
+    setDropTargetId(id)
+  }, [])
+
+  const handleReparentDrop = useCallback(
+    async (targetId: string) => {
+      const src = dragSourceRef.current
+      setDragSourceId(null)
+      setDropTargetId(null)
+      dragSourceRef.current = null
+      if (!src || src === targetId) return
+      const dbNodes = dbNodesRef.current
+      const srcNode = dbNodes.find(n => n.id === src)
+      const targetNode = dbNodes.find(n => n.id === targetId)
+      if (!srcNode || !targetNode) return
+      // ルートを動かそうとした場合は何もしない
+      if (srcNode.parent_id === null) return
+      // 子孫を親にはできない
+      const descendants = getDescendants(dbNodes, src)
+      if (descendants.has(targetId)) return
+      if (srcNode.parent_id === targetId) return
+
+      // 新しい side を計算: 対象がルートなら新規バランス、それ以外は親の side を継承
+      let newSide: 'left' | 'right' = 'right'
+      if (targetNode.parent_id === null) {
+        const right = dbNodes.filter(n => n.parent_id === targetId && n.side === 'right').length
+        const left = dbNodes.filter(n => n.parent_id === targetId && n.side === 'left').length
+        newSide = right <= left ? 'right' : 'left'
+      } else {
+        newSide = targetNode.side ?? 'right'
+      }
+      const newSortOrder = dbNodes.filter(
+        n => n.parent_id === targetId && n.side === newSide
+      ).length
+
+      // ローカル状態更新 (自分の子孫の side も新側へ揃える)
+      const descSet = getDescendants(dbNodes, src)
+      dbNodesRef.current = dbNodes.map(n => {
+        if (n.id === src) {
+          return { ...n, parent_id: targetId, side: newSide, sort_order: newSortOrder }
+        }
+        if (descSet.has(n.id)) {
+          return { ...n, side: newSide }
+        }
+        return n
+      })
+
+      // 永続化
+      await fetch(`/api/nodes/${src}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          parent_id: targetId,
+          side: newSide,
+          sort_order: newSortOrder,
+        }),
+      })
+      if (descSet.size > 0) {
+        await fetch('/api/nodes/bulk', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            updates: Array.from(descSet).map(id => ({ id, side: newSide })),
+          }),
+        })
+      }
+
+      const mapId = currentMapIdRef.current
+      if (mapId) await runAutoLayout(mapId)
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    },
+    []
+  )
+
+  // ===== 装飾(色 / アイコン)変更 =====
+  const handleChangeColor = useCallback((color: string | null) => {
+    const id = activeIdRef.current
+    if (!id) return
+    dbNodesRef.current = dbNodesRef.current.map(n =>
+      n.id === id ? { ...n, color } : n
+    )
+    void fetch(`/api/nodes/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ color }),
+    })
+    rerenderFromDb()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleChangeIcon = useCallback((icon: string | null) => {
+    const id = activeIdRef.current
+    if (!id) return
+    dbNodesRef.current = dbNodesRef.current.map(n =>
+      n.id === id ? { ...n, icon } : n
+    )
+    void fetch(`/api/nodes/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ icon }),
+    })
+    rerenderFromDb()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ===== DB → React Flow 変換 =====
   const rerenderFromDb = useCallback(() => {
     const dbNodes = dbNodesRef.current
     const visible = filterVisible(dbNodes)
@@ -136,6 +280,7 @@ export default function Home() {
         childCountMap.set(n.parent_id, (childCountMap.get(n.parent_id) ?? 0) + 1)
       }
     }
+    const curDropTarget = dropTargetId
     const rfNodes: Node[] = dbNodes
       .filter(n => visible.has(n.id))
       .map(n => ({
@@ -148,16 +293,21 @@ export default function Home() {
           side: n.side,
           childCount: childCountMap.get(n.id) ?? 0,
           collapsed: n.collapsed,
+          color: n.color,
+          icon: n.icon,
+          dropTarget: curDropTarget === n.id,
           onLabelChange: handleNodeLabelChange,
           onEditingChange: handleEditingChange,
           onToggleCollapse: handleToggleCollapse,
+          onReparentDragStart: handleReparentDragStart,
+          onReparentDragEnd: handleReparentDragEnd,
+          onReparentDragOver: handleReparentDragOver,
+          onReparentDrop: handleReparentDrop,
         },
       }))
-    // 木構造のエッジ: parent → child
     const rfEdges: Edge[] = dbNodes
       .filter(n => n.parent_id !== null && visible.has(n.id) && visible.has(n.parent_id!))
       .map(n => {
-        // 子の side で接続方向を決定
         const parentHandle = n.side === 'left' ? 'left' : 'right'
         const childHandle = n.side === 'left' ? 'target-right' : 'target-left'
         return {
@@ -171,9 +321,28 @@ export default function Home() {
       })
     setNodes(rfNodes)
     setEdges(rfEdges)
-  }, [handleNodeLabelChange, handleEditingChange, handleToggleCollapse])
+  }, [
+    handleNodeLabelChange,
+    handleEditingChange,
+    handleToggleCollapse,
+    handleReparentDragStart,
+    handleReparentDragEnd,
+    handleReparentDragOver,
+    handleReparentDrop,
+    dropTargetId,
+  ])
 
-  // ===== 自動レイアウトを実行して DB にも保存 =====
+  // ドロップターゲットが変わったら、対応ノードの data.dropTarget だけ更新
+  useEffect(() => {
+    setNodes(nds =>
+      nds.map(n => ({
+        ...n,
+        data: { ...n.data, dropTarget: dropTargetId === n.id },
+      }))
+    )
+  }, [dropTargetId])
+
+  // ===== 自動レイアウト =====
   const runAutoLayout = useCallback(async (mapId: string) => {
     const dbNodes = dbNodesRef.current
     if (dbNodes.length === 0) return
@@ -185,7 +354,6 @@ export default function Home() {
       collapsed: n.collapsed,
       text: n.text,
     }))
-    // ルートを画面中央っぽい位置に
     const results = computeLayout(layoutInput, 0, 0)
     const byId = new Map(results.map(r => [r.id, r]))
     dbNodesRef.current = dbNodes.map(n => {
@@ -194,7 +362,6 @@ export default function Home() {
       return { ...n, position_x: r.position_x, position_y: r.position_y, side: r.side }
     })
     rerenderFromDb()
-    // バルク保存
     await fetch('/api/nodes/bulk', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -207,11 +374,10 @@ export default function Home() {
         })),
       }),
     })
-    // mapId はバルク API では暗黙(id 指定なので不要)
     void mapId
   }, [rerenderFromDb])
 
-  // ===== 初回起動: マップ取得 or 作成 =====
+  // ===== 初回起動 =====
   useEffect(() => {
     async function bootstrap() {
       let list = (await fetch('/api/maps').then(r => r.json())) as DbMap[]
@@ -229,7 +395,7 @@ export default function Home() {
     bootstrap()
   }, [])
 
-  // ===== マップ切替時: ノードを取得 + ルートが無ければ作成 =====
+  // ===== マップ切替 =====
   useEffect(() => {
     if (!currentMapId) return
     let cancelled = false
@@ -237,7 +403,6 @@ export default function Home() {
       setLoading(true)
       let dbNodes = (await fetch(`/api/nodes?map_id=${mapId}`).then(r => r.json())) as DbNode[]
       if (cancelled) return
-      // ルート(parent_id = null)が無ければ自動作成
       const hasRoot = dbNodes.some(n => n.parent_id === null)
       if (!hasRoot) {
         const created = await fetch('/api/nodes', {
@@ -265,7 +430,7 @@ export default function Home() {
     }
   }, [currentMapId, updateActive, rerenderFromDb])
 
-  // ===== ノード作成(親指定) =====
+  // ===== ノード作成(子) =====
   const createChildNode = useCallback(
     async (parentId: string, opts: { text?: string; activate?: boolean } = {}) => {
       const mapId = currentMapIdRef.current
@@ -274,7 +439,6 @@ export default function Home() {
       const parent = dbNodes.find(n => n.id === parentId)
       if (!parent) return null
 
-      // side の決定: 親がルートなら左右バランス、それ以外は親の side を継承
       let side: 'left' | 'right' = 'right'
       if (parent.parent_id === null) {
         const rightCount = dbNodes.filter(n => n.parent_id === parent.id && n.side === 'right').length
@@ -284,7 +448,6 @@ export default function Home() {
         side = parent.side ?? 'right'
       }
 
-      // sort_order: 兄弟の末尾
       const siblings = dbNodes.filter(n => n.parent_id === parent.id && n.side === side)
       const sortOrder = siblings.length
 
@@ -304,7 +467,6 @@ export default function Home() {
       if (!res.ok) return null
       const newNode: DbNode = await res.json()
       dbNodesRef.current = [...dbNodesRef.current, newNode]
-      // 自動レイアウト → 描画
       await runAutoLayout(mapId)
       if (opts.activate !== false) {
         updateActive(newNode.id)
@@ -314,7 +476,7 @@ export default function Home() {
     [runAutoLayout, updateActive]
   )
 
-  // ===== 兄弟ノード作成 =====
+  // ===== ノード作成(兄弟) =====
   const createSiblingNode = useCallback(
     async (nodeId: string, opts: { text?: string; activate?: boolean } = {}) => {
       const mapId = currentMapIdRef.current
@@ -322,9 +484,7 @@ export default function Home() {
       const dbNodes = dbNodesRef.current
       const target = dbNodes.find(n => n.id === nodeId)
       if (!target) return null
-      // ルートに兄弟は作れない(ルート自体が唯一)
       if (target.parent_id === null) return null
-      // 同じ親・同じ side の末尾に追加
       const siblings = dbNodes.filter(
         n => n.parent_id === target.parent_id && n.side === target.side
       )
@@ -354,13 +514,12 @@ export default function Home() {
     [runAutoLayout, updateActive]
   )
 
-  // ===== ノードのドラッグ → 位置だけDBに保存(parent_id は維持) =====
+  // ===== ノード位置のドラッグ =====
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       setNodes(nds => applyNodeChanges(changes, nds))
       changes.forEach(change => {
         if (change.type === 'position' && change.dragging === false && change.position) {
-          // dbNodesRef も同期
           dbNodesRef.current = dbNodesRef.current.map(n =>
             n.id === change.id
               ? { ...n, position_x: change.position!.x, position_y: change.position!.y }
@@ -389,13 +548,11 @@ export default function Home() {
       return
     }
     if (!window.confirm('このノードと子孫を全て削除しますか?')) return
-    // DB は CASCADE で子孫も消える
     const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' })
     if (!res.ok) {
       alert('削除に失敗しました')
       return
     }
-    // クライアント側: 子孫を再帰収集して除外
     const toDelete = new Set<string>()
     const stack = [nodeId]
     while (stack.length > 0) {
@@ -411,7 +568,7 @@ export default function Home() {
     if (mapId) await runAutoLayout(mapId)
   }, [runAutoLayout, updateActive])
 
-  // ===== マップ全部消去(ルートは残す) =====
+  // ===== 全部消去 =====
   const handleClearAll = async () => {
     if (!currentMapId) return
     if (!window.confirm('このマップの全ノード(ルート以外)を削除します。よろしいですか?')) return
@@ -420,11 +577,10 @@ export default function Home() {
       alert('削除に失敗しました')
       return
     }
-    // 再ロード(ルートを再生成)
-    setCurrentMapId(currentMapId) // useEffect で reload はされないので明示再取得
+    setCurrentMapId(currentMapId)
     const dbNodes = (await fetch(`/api/nodes?map_id=${currentMapId}`).then(r => r.json())) as DbNode[]
-    let nodes = dbNodes
-    const hasRoot = nodes.some(n => n.parent_id === null)
+    let ns = dbNodes
+    const hasRoot = ns.some(n => n.parent_id === null)
     if (!hasRoot) {
       const created = await fetch('/api/nodes', {
         method: 'POST',
@@ -438,9 +594,9 @@ export default function Home() {
           sort_order: 0,
         }),
       }).then(r => r.json())
-      nodes = [created]
+      ns = [created]
     }
-    dbNodesRef.current = nodes
+    dbNodesRef.current = ns
     rerenderFromDb()
     updateActive(null)
   }
@@ -489,9 +645,7 @@ export default function Home() {
     setCurrentMapId(created.id)
   }
 
-  // ===== キーボードショートカット =====
-  // Tab: 子ノード追加, Enter: 兄弟ノード追加, Delete: サブツリー削除
-  // 矢印: ノード間移動(親/子/兄弟)
+  // ===== キーボード =====
   useEffect(() => {
     if (!currentMapId) return
     const handler = (e: KeyboardEvent) => {
@@ -500,7 +654,6 @@ export default function Home() {
         const tag = focused.tagName
         if (tag === 'INPUT' || tag === 'TEXTAREA' || focused.isContentEditable) return
       }
-
       const activeId = activeIdRef.current
       const dbNodes = dbNodesRef.current
 
@@ -528,7 +681,6 @@ export default function Home() {
       } else if (e.key === 'F2') {
         if (!activeId) return
         e.preventDefault()
-        // 編集モード起動: そのノードのラベルダブルクリック相当を模倣
         const el = document.querySelector(`[data-id="${activeId}"] .react-flow__node`)
         if (el) {
           ;(el as HTMLElement).dispatchEvent(
@@ -548,7 +700,6 @@ export default function Home() {
         let nextId: string | null = null
         if (e.key === 'ArrowLeft') {
           if (cur.side === 'left') {
-            // 左方向の子へ
             const child = dbNodes
               .filter(n => n.parent_id === cur.id && n.side === 'left')
               .sort((a, b) => a.sort_order - b.sort_order)[0]
@@ -559,7 +710,6 @@ export default function Home() {
               .sort((a, b) => a.sort_order - b.sort_order)[0]
             if (child) nextId = child.id
           } else {
-            // 親へ
             nextId = cur.parent_id
           }
         } else if (e.key === 'ArrowRight') {
@@ -572,7 +722,6 @@ export default function Home() {
             nextId = cur.parent_id
           }
         } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-          // 兄弟間移動
           if (cur.parent_id) {
             const siblings = dbNodes
               .filter(n => n.parent_id === cur.parent_id && n.side === cur.side)
@@ -589,7 +738,6 @@ export default function Home() {
     return () => window.removeEventListener('keydown', handler)
   }, [currentMapId, createChildNode, createSiblingNode, deleteSubtree, updateActive])
 
-  // ===== ノードクリックで active 更新 =====
   const onNodeClick = useCallback(
     (_event: MouseEvent, node: Node) => {
       updateActive(node.id)
@@ -597,7 +745,6 @@ export default function Home() {
     [updateActive]
   )
 
-  // ===== 選択状態を React Flow に反映 =====
   useEffect(() => {
     setNodes(nds => nds.map(n => ({ ...n, selected: n.id === activeNodeId })))
   }, [activeNodeId])
@@ -616,9 +763,12 @@ export default function Home() {
     fontSize: 14,
   } as const
 
+  // 現在のアクティブノード情報(ツールバー用)
+  const activeDb = activeNodeId ? dbNodesRef.current.find(n => n.id === activeNodeId) : null
+
   return (
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
-      {/* 上段: マップ操作 */}
+      {/* 上段 */}
       <div
         style={{
           position: 'absolute',
@@ -666,7 +816,7 @@ export default function Home() {
         </button>
       </div>
 
-      {/* 下段: ノード操作 */}
+      {/* 下段 */}
       <div
         style={{
           position: 'absolute',
@@ -710,7 +860,16 @@ export default function Home() {
         </button>
       </div>
 
-      {/* ヘルプ表示 */}
+      {/* 装飾ツールバー(ノード選択中のみ) */}
+      <NodeToolbar
+        visible={!!activeDb}
+        currentColor={activeDb?.color ?? null}
+        currentIcon={activeDb?.icon ?? null}
+        onChangeColor={handleChangeColor}
+        onChangeIcon={handleChangeIcon}
+      />
+
+      {/* ヘルプ */}
       <div
         style={{
           position: 'absolute',
@@ -725,7 +884,7 @@ export default function Home() {
           lineHeight: 1.5,
         }}
       >
-        Tab: 子追加 / Enter: 兄弟追加 / F2: 編集 / Delete: 削除 / 矢印: 移動
+        Tab: 子追加 / Enter: 兄弟追加 / F2: 編集 / Delete: 削除 / 矢印: 移動 / ⤴: 親変更
       </div>
 
       <ReactFlow

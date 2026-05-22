@@ -17,7 +17,12 @@
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--node-border-active) 30%, transparent);
 }
 
-/* ルートノード: 丸みを強く、太字、わずかに大きめ */
+.node.dropTarget {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.4);
+}
+
+/* ルートノード: 丸みを強く、太字 */
 .node.root {
   border-radius: 24px;
   padding: 12px 22px;
@@ -28,11 +33,24 @@
   border-color: var(--node-border-active);
 }
 
+.body {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.icon {
+  font-size: 16px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
 .label {
   cursor: text;
   white-space: pre-wrap;
   word-break: break-word;
   min-height: 1.2em;
+  flex: 1;
 }
 
 .input {
@@ -94,4 +112,35 @@
 
 .badgeLeft {
   left: -11px;
+}
+
+/* 親付け替え用ドラッグハンドル(右上に小さく) */
+.moveHandle {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--node-bg);
+  color: var(--node-fg);
+  border: 1px solid var(--node-border);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  user-select: none;
+  box-shadow: var(--node-shadow);
+}
+
+.moveHandle:active {
+  cursor: grabbing;
+}
+
+.node:hover .moveHandle,
+.node.selected .moveHandle {
+  opacity: 0.9;
 }

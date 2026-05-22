@@ -41,6 +41,8 @@ export async function POST(request: Request) {
   if (body.side === 'left' || body.side === 'right') {
     insertPayload.side = body.side
   }
+  if (body.color !== undefined) insertPayload.color = body.color
+  if (body.icon !== undefined) insertPayload.icon = body.icon
 
   const { data, error } = await supabase
     .from('nodes')

@@ -17,6 +17,8 @@ export async function PATCH(
   if (body.sort_order !== undefined) updates.sort_order = body.sort_order
   if (body.collapsed !== undefined) updates.collapsed = body.collapsed
   if (body.side !== undefined) updates.side = body.side
+  if (body.color !== undefined) updates.color = body.color
+  if (body.icon !== undefined) updates.icon = body.icon
 
   const { data, error } = await supabase
     .from('nodes')
